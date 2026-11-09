@@ -365,8 +365,12 @@ async function buildShadowBoostedInput(file) {
 }
 
 /**
- * Composite the segmentation mask onto the ORIGINAL unmodified pixels,
- * hardening midrange alpha so dark jackets/shoulders never turn translucent.
+ * Composite the segmentation mask onto the ORIGINAL unmodified pixels.
+ * When `isDarkBackdrop` is true (studio portrait on a pure black 0..2 backdrop),
+ * we also scan each horizontal row for the outermost non-black subject span
+ * (`lum >= 2`) from the neck/shoulders down, and fill everything inside `[leftEdge..rightEdge]`
+ * at alpha = 255. That prevents ISNet from chopping off dark sleeves or leaving
+ * semi-transparent purple bleed-through when a dark jacket is crushed to near-black.
  */
 async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdrop) {
   const maskImg = await loadImageFromBlob(maskBlob);
@@ -381,23 +385,82 @@ async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdro
   const out = ctx.createImageData(w, h);
   const dst = out.data;
 
-  // Ramp: below lowCut -> 0; above highCut -> 255 (solid interior, no ghosting)
-  const lowCut = isDarkBackdrop ? 22 : 18;
-  const highCut = isDarkBackdrop ? 88 : 140;
-  const span = highCut - lowCut;
+  // Build row-wise silhouette span `[rowLeft[y], rowRight[y]]` for dark backdrops
+  const rowLeft = new Int32Array(h).fill(w);
+  const rowRight = new Int32Array(h).fill(-1);
+  if (isDarkBackdrop) {
+    for (let y = 0; y < h; y++) {
+      let l = w;
+      let r = -1;
+      for (let x = 0; x < w; x++) {
+        const idx = (y * w + x) * 4;
+        const lum = Math.max(orig[idx], orig[idx + 1], orig[idx + 2]);
+        const mA = maskData[idx + 3];
+        if (lum >= 2 || mA >= 80) {
+          if (x < l) l = x;
+          if (x > r) r = x;
+        }
+      }
+      rowLeft[y] = l;
+      rowRight[y] = r;
+    }
+    // Smooth the row boundaries with a 9-row moving median/average so JPEG blocks don't stair-step
+    const smoothL = new Int32Array(h);
+    const smoothR = new Int32Array(h);
+    for (let y = 0; y < h; y++) {
+      let sumL = 0, sumR = 0, cnt = 0;
+      for (let dy = -4; dy <= 4; dy++) {
+        const ny = y + dy;
+        if (ny >= 0 && ny < h && rowRight[ny] >= rowLeft[ny]) {
+          sumL += rowLeft[ny];
+          sumR += rowRight[ny];
+          cnt++;
+        }
+      }
+      smoothL[y] = cnt ? Math.round(sumL / cnt) : rowLeft[y];
+      smoothR[y] = cnt ? Math.round(sumR / cnt) : rowRight[y];
+    }
+    rowLeft.set(smoothL);
+    rowRight.set(smoothR);
+  }
 
-  for (let i = 0; i < orig.length; i += 4) {
-    dst[i] = orig[i];
-    dst[i + 1] = orig[i + 1];
-    dst[i + 2] = orig[i + 2];
-    const a = maskData[i + 3];
-    if (a <= lowCut) {
-      dst[i + 3] = 0;
-    } else if (a >= highCut) {
-      dst[i + 3] = 255;
-    } else {
-      const t = (a - lowCut) / span;
-      dst[i + 3] = Math.round(t * t * (3 - 2 * t) * 255);
+  const lowCut = 18;
+  const highCut = 120;
+  const span = highCut - lowCut;
+  const feather = 4; // 4px anti-aliased edge on the horizontal span
+
+  for (let y = 0; y < h; y++) {
+    const lEdge = rowLeft[y];
+    const rEdge = rowRight[y];
+    const hasSpan = isDarkBackdrop && rEdge >= lEdge;
+
+    for (let x = 0; x < w; x++) {
+      const i = (y * w + x) * 4;
+      dst[i] = orig[i];
+      dst[i + 1] = orig[i + 1];
+      dst[i + 2] = orig[i + 2];
+
+      const a = maskData[i + 3];
+      let maskAlpha = 0;
+      if (a <= lowCut) {
+        maskAlpha = 0;
+      } else if (a >= highCut) {
+        maskAlpha = 255;
+      } else {
+        const t = (a - lowCut) / span;
+        maskAlpha = Math.round(t * t * (3 - 2 * t) * 255);
+      }
+
+      if (hasSpan && x >= lEdge && x <= rEdge) {
+        const distToEdge = Math.min(x - lEdge, rEdge - x);
+        const spanAlpha =
+          distToEdge >= feather
+            ? 255
+            : Math.round(((distToEdge + 1) / (feather + 1)) * 255);
+        dst[i + 3] = Math.max(maskAlpha, spanAlpha);
+      } else {
+        dst[i + 3] = maskAlpha;
+      }
     }
   }
 
