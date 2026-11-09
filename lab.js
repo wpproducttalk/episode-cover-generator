@@ -645,39 +645,31 @@ async function exportPngClientSide() {
   ctx.fill();
   ctx.restore();
 
-  // 4. Wordmark in top-left
+  // 4. Wordmark in top-left (height 44px matching combined height of EPISODE + LIVE badge)
   const wordmarkUrl = "./cover/assets/wppt-wordmark.svg";
   try {
     const wmImg = await loadImg(wordmarkUrl);
-    const wmH = 52;
-    const wmW = (wmImg.naturalWidth / wmImg.naturalHeight) * wmH || 195;
+    const wmH = 44;
+    const wmW = (wmImg.naturalWidth / wmImg.naturalHeight) * wmH || 166;
     ctx.drawImage(wmImg, cardX + 40, cardY + 32, wmW, wmH);
   } catch {
     /* ignore */
   }
 
-  // 5. Top-right Episode pill + LIVE badge
+  // 5. Top-right Episode text (no pill background) + LIVE badge (combined height = 44px)
   const fp = fieldPayload();
   ctx.save();
   ctx.font = '700 13.1px "Noto Sans", system-ui, sans-serif';
   const epText = fp.eyebrow.toUpperCase();
-  const epMetrics = ctx.measureText(epText);
-  const pillW = epMetrics.width + 26;
-  const pillH = 26;
-  const pillX = cardX + cardW - 40 - pillW;
-  const pillY = cardY + 32;
-  ctx.fillStyle = "rgba(94, 83, 192, 0.12)";
-  ctx.beginPath();
-  ctx.roundRect(pillX, pillY, pillW, pillH, 999);
-  ctx.fill();
   ctx.fillStyle = "#38307f";
-  ctx.textBaseline = "middle";
-  ctx.fillText(epText, pillX + 13, pillY + pillH / 2 + 1);
+  ctx.textAlign = "right";
+  ctx.textBaseline = "top";
+  ctx.fillText(epText, cardX + cardW - 40, cardY + 32);
 
   const liveW = 48;
   const liveH = 22;
   const liveX = cardX + cardW - 40 - liveW;
-  const liveY = pillY + pillH + 6;
+  const liveY = cardY + 32 + 44 - liveH;
   ctx.fillStyle = "#e11d48";
   ctx.beginPath();
   ctx.roundRect(liveX, liveY, liveW, liveH, 4);
@@ -685,10 +677,11 @@ async function exportPngClientSide() {
   ctx.fillStyle = "#ffffff";
   ctx.font = '800 11.5px "Noto Sans", system-ui, sans-serif';
   ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
   ctx.fillText(fp.live, liveX + liveW / 2, liveY + liveH / 2 + 1);
   ctx.restore();
 
-  // 6. Title + Guest line
+  // 6. Title + Guest line + Sparkles
   ctx.save();
   ctx.fillStyle = "#171329";
   ctx.font = '700 44px "Noto Sans", system-ui, sans-serif';
@@ -723,7 +716,32 @@ async function exportPngClientSide() {
 
   ctx.font = '800 26.4px "Noto Sans", system-ui, sans-serif';
   ctx.fillStyle = "#38307f";
-  ctx.fillText(fp.guestName, cardX + 40 + prefixW, textY);
+  const nameX = cardX + 40 + prefixW;
+  ctx.fillText(fp.guestName, nameX, textY);
+  const nameW = ctx.measureText(fp.guestName).width;
+
+  // Draw the AuroraText-style 4-point sparkles over/right of the guest name
+  const sparkleSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="180" height="54" viewBox="0 0 180 54" fill="none">
+    <g transform="translate(18 8) rotate(-14) scale(0.95)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+    <g transform="translate(68 42) rotate(12) scale(0.55)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+    <g transform="translate(106 10) rotate(-18) scale(0.85)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+    <g transform="translate(124 41) rotate(16) scale(1.08)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+    <g transform="translate(154 22) rotate(-10) scale(0.78)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#a81de9"/></g>
+    <g transform="translate(169 37) rotate(22) scale(0.48)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+    <g transform="translate(142 8) rotate(8) scale(0.42)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+  </svg>`;
+  try {
+    const spImg = await loadImg(
+      `data:image/svg+xml;charset=utf-8,${encodeURIComponent(sparkleSvg)}`
+    );
+    const spW = 168;
+    const spH = 49.6;
+    const spX = nameX + nameW + 38.4 + 2.4 - spW;
+    const spY = textY + 16.5 - spH * 0.54;
+    ctx.drawImage(spImg, spX, spY, spW, spH);
+  } catch {
+    /* ignore */
+  }
   ctx.restore();
 
   // 7. Co-hosts section
