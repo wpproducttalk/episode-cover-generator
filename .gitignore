@@ -1,0 +1,4 @@
+node_modules/
+.env
+_test-cutout.png
+_verify-*.png

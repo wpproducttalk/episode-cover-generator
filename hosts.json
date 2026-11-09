@@ -1,0 +1,26 @@
+[
+  {
+    "id": "matt",
+    "name": "Matt Cromwell",
+    "photo": "assets/hosts/matt-cromwell.png",
+    "focus": "50% 50%"
+  },
+  {
+    "id": "katie",
+    "name": "Katie Keith",
+    "photo": "assets/hosts/katie-keith.png",
+    "focus": "50% 50%"
+  },
+  {
+    "id": "zack",
+    "name": "Zack Katz",
+    "photo": "assets/hosts/zack-katz.png",
+    "focus": "50% 50%"
+  },
+  {
+    "id": "ian",
+    "name": "Ian Misner",
+    "photo": "assets/hosts/ian-misner.png",
+    "focus": "50% 50%"
+  }
+]

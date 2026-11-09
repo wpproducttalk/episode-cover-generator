@@ -1,0 +1,15 @@
+/* Figma pair: Gotham headings, Noto Sans Light body.
+   The only Gotham file on wpproducttalk.com is named gotham-bold and is
+   applied at weight 400. Book and Medium files are not on that host, and the
+   woff2 has no cross-origin header, so this test loads a local copy.
+   That copy is gitignored. Without the file, headings fall back to Noto Sans. */
+
+@import url("https://fonts.googleapis.com/css2?family=Noto+Sans:ital,wght@0,300;0,400;0,500;0,700;1,400&display=swap");
+
+@font-face {
+  font-family: "gotham-bold";
+  src: url("../assets/fonts/gotham-bold.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}

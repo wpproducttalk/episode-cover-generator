@@ -1,0 +1,29 @@
+/* Vendored WPPT tokens for episode covers (from wp-product-talk brand). */
+
+:root {
+  --wppt-primary-deep: #38307f;
+  --wppt-primary: #5e53c0;
+  --wppt-primary-3: #a81de9;
+  --wppt-accent: #fed000;
+  --wppt-accent-soft: #fff6c2;
+  --wppt-on-dark: #ffffff;
+  --wppt-on-dark-muted: rgba(255, 255, 255, 0.82);
+  --wppt-ink-deep: #171329;
+  --wppt-ink-muted: #4a5568;
+  --wppt-surface: #ffffff;
+  --wppt-rule: rgba(56, 48, 127, 0.2);
+  --wppt-radius-lg: 1.125rem;
+  --wppt-radius-pill: 999px;
+  --wppt-shadow-hard: 6px 8px 0 rgba(23, 19, 41, 0.85);
+  --wppt-shadow-glass: 0 18px 48px rgba(56, 48, 127, 0.35);
+  --wppt-font: "Noto Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --wppt-gradient: linear-gradient(
+    118deg,
+    #1a1640 0%,
+    #38307f 22%,
+    #5e53c0 48%,
+    #7c3fb8 72%,
+    #a81de9 88%,
+    #c45ce0 100%
+  );
+}

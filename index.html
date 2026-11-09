@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WP Product Talk — Episode Cover Generator</title>
+    <link rel="icon" href="./cover/assets/wppt-mark.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="./vendor/css/cds.css" />
+    <link rel="stylesheet" href="./lab.css" />
+  </head>
+  <body>
+    <div class="wppt-lab">
+      <header class="wppt-lab__head">
+        <img
+          class="wppt-lab__brand-mark"
+          src="./cover/assets/wppt-mark.svg"
+          alt="WP Product Talk"
+          width="44"
+          height="44"
+        />
+        <h1 class="wppt-lab__title">Episode Cover Generator</h1>
+      </header>
+
+      <div class="wppt-lab__grid">
+        <aside class="wppt-lab__aside">
+          <div class="wppt-lab__sidebar">
+            <div class="wppt-lab__tabs" role="tablist" aria-label="Cover settings">
+              <button
+                type="button"
+                class="wppt-lab__tab is-active"
+                role="tab"
+                id="tab-btn-details"
+                aria-selected="true"
+                aria-controls="tab-panel-details"
+                data-tab="details"
+              >
+                Details
+              </button>
+              <button
+                type="button"
+                class="wppt-lab__tab"
+                role="tab"
+                id="tab-btn-background"
+                aria-selected="false"
+                aria-controls="tab-panel-background"
+                data-tab="background"
+                tabindex="-1"
+              >
+                Background
+              </button>
+              <button
+                type="button"
+                class="wppt-lab__tab"
+                role="tab"
+                id="tab-btn-cohosts"
+                aria-selected="false"
+                aria-controls="tab-panel-cohosts"
+                data-tab="cohosts"
+                tabindex="-1"
+              >
+                Co-hosts
+              </button>
+              <button
+                type="button"
+                class="wppt-lab__tab"
+                role="tab"
+                id="tab-btn-guest"
+                aria-selected="false"
+                aria-controls="tab-panel-guest"
+                data-tab="guest"
+                tabindex="-1"
+              >
+                Guest
+              </button>
+            </div>
+
+            <div class="wppt-lab__tab-panels">
+              <section
+                class="wppt-lab__tab-panel is-active"
+                role="tabpanel"
+                id="tab-panel-details"
+                aria-labelledby="tab-btn-details"
+              >
+                <div class="wppt-lab__field-row">
+                  <div class="cds-field wppt-lab__field--compact">
+                    <label for="episode">Episode #</label>
+                    <input id="episode" class="cds-input" type="text" value="214" />
+                  </div>
+                  <div class="cds-field">
+                    <label for="date">Air date</label>
+                    <input id="date" class="cds-input" type="text" value="Nov 18, 2026" />
+                  </div>
+                </div>
+                <div class="cds-field">
+                  <label for="title">Episode title</label>
+                  <input id="title" class="cds-input" type="text" value="Data-driven product decisions" />
+                </div>
+                <div class="cds-field">
+                  <label for="guestName">Guest name</label>
+                  <input id="guestName" class="cds-input" type="text" value="Derek Hinchcliffe" />
+                </div>
+              </section>
+
+              <section
+                class="wppt-lab__tab-panel"
+                role="tabpanel"
+                id="tab-panel-background"
+                aria-labelledby="tab-btn-background"
+                hidden
+              >
+                <p class="wppt-lab__subhead">Gradient</p>
+                <p class="wppt-lab__panel-lede">Stripe colors on the card and brand rule.</p>
+                <div
+                  class="wppt-lab__gradients"
+                  id="gradientPicker"
+                  role="radiogroup"
+                  aria-label="Background gradient"
+                ></div>
+                <p class="wppt-lab__subhead">Overlay pattern</p>
+                <p class="wppt-lab__panel-lede">Texture above the gradient.</p>
+                <div
+                  class="wppt-lab__gradients wppt-lab__patterns"
+                  id="patternPicker"
+                  role="radiogroup"
+                  aria-label="Overlay pattern"
+                ></div>
+              </section>
+
+              <section
+                class="wppt-lab__tab-panel"
+                role="tabpanel"
+                id="tab-panel-cohosts"
+                aria-labelledby="tab-btn-cohosts"
+                hidden
+              >
+                <p class="wppt-lab__panel-lede">Tap to include on the card.</p>
+                <div class="wppt-lab__cohosts" id="cohostPicker" role="group" aria-label="Co-hosts"></div>
+              </section>
+
+              <section
+                class="wppt-lab__tab-panel"
+                role="tabpanel"
+                id="tab-panel-guest"
+                aria-labelledby="tab-btn-guest"
+                hidden
+              >
+                <div class="cds-field">
+                  <label for="guestPhoto">Upload</label>
+                  <input id="guestPhoto" class="cds-input wppt-lab__file" type="file" accept="image/*" />
+                  <p class="wppt-lab__panel-lede">Already a cutout? <strong>Apply photo</strong> only.</p>
+                </div>
+                <div class="wppt-lab__guest-actions" id="guestActions">
+                  <button type="button" class="cds-btn cds-btn--secondary" id="btnApplyPhoto">
+                    Apply photo
+                  </button>
+                  <button
+                    type="button"
+                    class="cds-btn cds-btn--primary"
+                    id="btnCutoutLocal"
+                    hidden
+                  >
+                    Remove background
+                  </button>
+                </div>
+                <div class="wppt-lab__guest-placement">
+                  <p class="wppt-lab__subhead">Position on cover</p>
+                  <div class="wppt-lab__nudge">
+                    <label class="cds-meta" for="guestX">Left / right</label>
+                    <input id="guestX" class="cds-input wppt-lab__range" type="range" min="-160" max="160" step="4" value="0" />
+                    <output id="guestXVal" class="wppt-lab__nudge-val">0</output>
+                  </div>
+                  <div class="wppt-lab__nudge">
+                    <label class="cds-meta" for="guestY">Up / down</label>
+                    <input id="guestY" class="cds-input wppt-lab__range" type="range" min="-120" max="80" step="4" value="0" />
+                    <output id="guestYVal" class="wppt-lab__nudge-val">0</output>
+                  </div>
+                  <div class="wppt-lab__nudge">
+                    <label class="cds-meta" for="guestScale">Size</label>
+                    <input id="guestScale" class="cds-input wppt-lab__range" type="range" min="55" max="145" step="1" value="100" />
+                    <output id="guestScaleVal" class="wppt-lab__nudge-val">100%</output>
+                  </div>
+                </div>
+              </section>
+            </div>
+
+            <div class="wppt-lab__aside-foot">
+              <button type="button" class="cds-btn cds-btn--primary wppt-lab__export" id="btnGeneratePng">
+                Generate PNG (2560×1440)
+              </button>
+              <p id="status" class="wppt-lab__status" role="status">Loading preview…</p>
+            </div>
+          </div>
+        </aside>
+
+        <div id="frames" class="wppt-lab__variants"></div>
+      </div>
+    </div>
+    <script type="module" src="lab.js"></script>
+  </body>
+</html>
