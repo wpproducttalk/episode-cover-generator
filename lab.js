@@ -284,6 +284,127 @@ async function blobUrlToDataUrl(url) {
   return fileToDataUrl(blob);
 }
 
+async function loadImageFromBlob(blob) {
+  const url = URL.createObjectURL(blob);
+  try {
+    return await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("Could not decode image"));
+      img.src = url;
+    });
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * Build a shadow-lifted detection image when the backdrop is very dark,
+ * so ISNet sees a crisp shoulder/jacket boundary (e.g. luminance 8..17 vs 0)
+ * without altering the original photo's pixel colors in the final composite.
+ */
+async function buildShadowBoostedInput(file) {
+  const img = await loadImageFromBlob(file);
+  const w = img.naturalWidth || img.width;
+  const h = img.naturalHeight || img.height;
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+
+  const origImageData = ctx.getImageData(0, 0, w, h);
+  const data = origImageData.data;
+
+  // Sample outer top/side border luminance to detect dark studio backgrounds
+  let borderSum = 0;
+  let borderCount = 0;
+  const step = Math.max(1, Math.floor(Math.min(w, h) / 60));
+  const margin = Math.max(4, Math.floor(Math.min(w, h) * 0.04));
+  for (let y = 0; y < Math.floor(h * 0.65); y += step) {
+    for (const x of [margin, w - 1 - margin]) {
+      const i = (y * w + x) * 4;
+      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+      borderSum += lum;
+      borderCount++;
+    }
+  }
+  const avgBorderLum = borderCount > 0 ? borderSum / borderCount : 128;
+  const isDarkBackdrop = avgBorderLum < 28;
+
+  if (!isDarkBackdrop) {
+    return { detectBlob: file, origImageData, w, h, isDarkBackdrop: false };
+  }
+
+  // Build a lookup table that keeps true black (0..3) at 0, and steeply lifts
+  // dark clothing shadows (4..45 -> 35..175) with a γ=0.36 curve
+  const lut = new Uint8ClampedArray(256);
+  const floor = Math.min(4, Math.floor(avgBorderLum + 2));
+  for (let v = 0; v < 256; v++) {
+    if (v <= floor) {
+      lut[v] = 0;
+    } else {
+      const norm = (v - floor) / (255 - floor);
+      lut[v] = Math.min(255, Math.round(Math.pow(norm, 0.36) * 255));
+    }
+  }
+
+  const boosted = ctx.createImageData(w, h);
+  const bData = boosted.data;
+  for (let i = 0; i < data.length; i += 4) {
+    bData[i] = lut[data[i]];
+    bData[i + 1] = lut[data[i + 1]];
+    bData[i + 2] = lut[data[i + 2]];
+    bData[i + 3] = data[i + 3];
+  }
+  ctx.putImageData(boosted, 0, 0);
+  const detectBlob = await new Promise((resolve) =>
+    canvas.toBlob(resolve, "image/png")
+  );
+  return { detectBlob, origImageData, w, h, isDarkBackdrop: true };
+}
+
+/**
+ * Composite the segmentation mask onto the ORIGINAL unmodified pixels,
+ * hardening midrange alpha so dark jackets/shoulders never turn translucent.
+ */
+async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdrop) {
+  const maskImg = await loadImageFromBlob(maskBlob);
+  const canvas = document.createElement("canvas");
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(maskImg, 0, 0, w, h);
+
+  const maskData = ctx.getImageData(0, 0, w, h).data;
+  const orig = origImageData.data;
+  const out = ctx.createImageData(w, h);
+  const dst = out.data;
+
+  // Ramp: below lowCut -> 0; above highCut -> 255 (solid interior, no ghosting)
+  const lowCut = isDarkBackdrop ? 22 : 18;
+  const highCut = isDarkBackdrop ? 88 : 140;
+  const span = highCut - lowCut;
+
+  for (let i = 0; i < orig.length; i += 4) {
+    dst[i] = orig[i];
+    dst[i + 1] = orig[i + 1];
+    dst[i + 2] = orig[i + 2];
+    const a = maskData[i + 3];
+    if (a <= lowCut) {
+      dst[i + 3] = 0;
+    } else if (a >= highCut) {
+      dst[i + 3] = 255;
+    } else {
+      const t = (a - lowCut) / span;
+      dst[i + 3] = Math.round(t * t * (3 - 2 * t) * 255);
+    }
+  }
+
+  ctx.putImageData(out, 0, 0);
+  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+}
+
 async function runCutoutLocal(file) {
   if (!guestPhotoApplied) {
     setStatus("Apply the photo to the preview first.", true);
@@ -292,20 +413,35 @@ async function runCutoutLocal(file) {
   btnCutoutLocal.disabled = true;
   btnApply.disabled = true;
   broadcastCutoutProcessing(true);
-  setStatus("Removing background locally (first run may download WASM)…");
+  setStatus("Removing background locally (full-precision ISNet)…");
   try {
-    const blob = await removeBackground(file, {
+    const { detectBlob, origImageData, w, h, isDarkBackdrop } =
+      await buildShadowBoostedInput(file);
+    const rawCutoutBlob = await removeBackground(detectBlob, {
+      model: "isnet",
+      output: { format: "image/png", quality: 1 },
       progress: (key, current, total) => {
         if (total) {
           setStatus(`Cutout: ${key} ${Math.round((current / total) * 100)}%`);
         }
       },
     });
+    const cleanBlob = await compositeCleanCutout(
+      rawCutoutBlob,
+      origImageData,
+      w,
+      h,
+      isDarkBackdrop
+    );
     revokeGuestUrl();
-    guestObjectUrl = URL.createObjectURL(blob);
+    guestObjectUrl = URL.createObjectURL(cleanBlob);
     guestSrc = guestObjectUrl;
     broadcast();
-    setStatus("Cutout applied.");
+    setStatus(
+      isDarkBackdrop
+        ? "Cutout applied (shadow-boosted mask for dark backdrop)."
+        : "Cutout applied."
+    );
   } catch (err) {
     setStatus(err.message || String(err), true);
   } finally {
