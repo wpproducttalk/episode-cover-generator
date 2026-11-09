@@ -418,7 +418,7 @@ async function runCutoutLocal(file) {
     const { detectBlob, origImageData, w, h, isDarkBackdrop } =
       await buildShadowBoostedInput(file);
     const rawCutoutBlob = await removeBackground(detectBlob, {
-      model: "isnet",
+      model: "medium",
       output: { format: "image/png", quality: 1 },
       progress: (key, current, total) => {
         if (total) {
