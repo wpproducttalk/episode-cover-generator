@@ -188,6 +188,19 @@
                 Generate PNG (2560×1440)
               </button>
               <p id="status" class="wppt-lab__status" role="status">Loading preview…</p>
+
+              <details id="debugDrawer" class="wppt-lab__debug" hidden>
+                <summary class="wppt-lab__debug-summary">Diagnostics (local / ?debug=1)</summary>
+                <div class="wppt-lab__debug-body">
+                  <div class="wppt-lab__debug-actions">
+                    <button type="button" class="cds-btn cds-btn--secondary wppt-lab__debug-btn" id="btnCopyDebug">
+                      Copy JSON report
+                    </button>
+                  </div>
+                  <img id="debugCutoutStages" class="wppt-lab__debug-img" alt="Cutout stages preview" hidden />
+                  <pre id="debugLog" class="wppt-lab__debug-pre">No diagnostics recorded yet.</pre>
+                </div>
+              </details>
             </div>
           </div>
         </aside>

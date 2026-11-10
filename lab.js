@@ -73,6 +73,50 @@ const btnCutoutLocal = document.getElementById("btnCutoutLocal");
 const btnApply = document.getElementById("btnApplyPhoto");
 const btnGeneratePng = document.getElementById("btnGeneratePng");
 const fileInput = document.getElementById("guestPhoto");
+const debugDrawer = document.getElementById("debugDrawer");
+const debugLogEl = document.getElementById("debugLog");
+const debugStagesImg = document.getElementById("debugCutoutStages");
+const btnCopyDebug = document.getElementById("btnCopyDebug");
+
+const IS_DEBUG_ENABLED =
+  IS_LOCAL_LAB_SERVER ||
+  new URLSearchParams(window.location.search).get("debug") === "1";
+
+const debugState = {
+  updatedAt: null,
+  cutout: null,
+  layout: null,
+  export: null,
+};
+
+function updateDebugUI(extraFiles = {}) {
+  debugState.updatedAt = new Date().toISOString();
+  if (IS_DEBUG_ENABLED && debugDrawer) {
+    debugDrawer.hidden = false;
+    if (debugLogEl) {
+      debugLogEl.textContent = JSON.stringify(debugState, null, 2);
+    }
+    if (debugStagesImg && extraFiles.cutoutStagesDataUrl) {
+      debugStagesImg.src = extraFiles.cutoutStagesDataUrl;
+      debugStagesImg.hidden = false;
+    }
+  }
+  if (IS_LOCAL_LAB_SERVER) {
+    fetch("/api/debug/save", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        report: debugState,
+        ...extraFiles,
+      }),
+    }).catch(() => {});
+  }
+}
+
+btnCopyDebug?.addEventListener("click", () => {
+  navigator.clipboard?.writeText(JSON.stringify(debugState, null, 2));
+  setStatus("Copied diagnostic JSON report to clipboard.");
+});
 
 let guestSrc = null;
 let guestFile = null;
@@ -128,10 +172,15 @@ function fieldPayload() {
   const title = fields.title.value.trim() || "Episode title";
   const guest = fields.guest.value.trim() || "Featured guest";
   const date = fields.date.value.trim() || "Nov 18, 2026";
+  const isPluralGuest = /\b(&|and)\b|,/i.test(guest);
+  const guestPrefix = isPluralGuest
+    ? "with special guests:"
+    : "with special guest:";
   return {
     eyebrow: ep ? `Episode ${ep}` : "WP Product Talk",
     title,
-    guest: `with special guest: ${guest}`,
+    guest: `${guestPrefix} ${guest}`,
+    guestPrefix,
     guestName: guest,
     meta: guest,
     guestLine: `Guest: ${guest}`,
@@ -177,11 +226,67 @@ function broadcastPayload() {
   };
 }
 
+function captureLiveLayoutTelemetry() {
+  if (!IS_DEBUG_ENABLED) return;
+  const iframeDoc = iframes[0]?.contentDocument;
+  const rootEl = iframeDoc?.querySelector("[data-asset-canvas]");
+  const titleEl = iframeDoc?.querySelector(".wpep-title");
+  if (!iframeDoc || !rootEl || !titleEl) return;
+
+  const rootRect = rootEl.getBoundingClientRect();
+  const scaleX = rootRect.width > 0 ? rootRect.width / CANVAS_W : 1;
+  const scaleY = rootRect.height > 0 ? rootRect.height / CANVAS_H : 1;
+  const toLogicalRect = (domRect) => {
+    const left = (domRect.left - rootRect.left) / scaleX;
+    const top = (domRect.top - rootRect.top) / scaleY;
+    const width = domRect.width / scaleX;
+    const height = domRect.height / scaleY;
+    return { left, top, width, height, right: left + width, bottom: top + height };
+  };
+
+  const cs = iframeDoc.defaultView.getComputedStyle(titleEl);
+  const fontPx = parseFloat(cs.fontSize) || 68;
+  let stepTrace = [];
+  try {
+    stepTrace = JSON.parse(titleEl.dataset.fitTrace || "[]");
+  } catch {
+    stepTrace = [];
+  }
+  const domLines = extractRenderedLines(titleEl, toLogicalRect).map((ln) => ({
+    text: ln.text,
+    left: Math.round(ln.left * 10) / 10,
+    top: Math.round(ln.top * 10) / 10,
+  }));
+  const cardEl = iframeDoc.querySelector(".wpep-card");
+  const cardR = cardEl ? toLogicalRect(cardEl.getBoundingClientRect()) : null;
+
+  debugState.layout = {
+    rawTitle: fieldPayload().title,
+    titleCharCount: fieldPayload().title.length,
+    chosenFontPx: fontPx,
+    lineCount: domLines.length,
+    stepTrace,
+    renderedLines: domLines,
+    cardRect: cardR
+      ? {
+          left: Math.round(cardR.left),
+          top: Math.round(cardR.top),
+          width: Math.round(cardR.width),
+          height: Math.round(cardR.height),
+        }
+      : null,
+  };
+  if (debugDrawer && !debugDrawer.hidden && debugLogEl) {
+    debugLogEl.textContent = JSON.stringify(debugState, null, 2);
+  }
+}
+
 function broadcast() {
   const message = broadcastPayload();
   for (const frame of iframes) {
     frame.contentWindow?.postMessage(message, window.location.origin);
   }
+  setTimeout(captureLiveLayoutTelemetry, 50);
 }
 
 function broadcastCutoutProcessing(processing) {
@@ -299,8 +404,10 @@ async function loadImageFromBlob(blob) {
 }
 
 /**
- * Build a shadow-lifted detection image when the backdrop is very dark,
- * so ISNet sees a crisp shoulder/jacket boundary (e.g. luminance 8..17 vs 0)
+ * Detect uniform studio backdrops (black, dark grey, mid grey, navy, etc.)
+ * via border sampling + connected flood-fill, then build a high-contrast
+ * detection image for ISNet (turning the connected backdrop pure white when
+ * the subject's lower torso/jacket is dark, or lifting dark shadows on black)
  * without altering the original photo's pixel colors in the final composite.
  */
 async function buildShadowBoostedInput(file) {
@@ -316,63 +423,265 @@ async function buildShadowBoostedInput(file) {
   const origImageData = ctx.getImageData(0, 0, w, h);
   const data = origImageData.data;
 
-  // Sample outer top/side border luminance to detect dark studio backgrounds
-  let borderSum = 0;
-  let borderCount = 0;
+  // Sample outer top/side border pixels (above shoulder height y < 0.62*h)
+  const samplesR = [];
+  const samplesG = [];
+  const samplesB = [];
+  const samplesLum = [];
   const step = Math.max(1, Math.floor(Math.min(w, h) / 60));
-  const margin = Math.max(4, Math.floor(Math.min(w, h) * 0.04));
-  for (let y = 0; y < Math.floor(h * 0.65); y += step) {
+  const margin = Math.max(4, Math.floor(Math.min(w, h) * 0.03));
+
+  for (let y = 0; y < Math.floor(h * 0.62); y += step) {
     for (const x of [margin, w - 1 - margin]) {
       const i = (y * w + x) * 4;
-      const lum = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-      borderSum += lum;
-      borderCount++;
+      samplesR.push(data[i]);
+      samplesG.push(data[i + 1]);
+      samplesB.push(data[i + 2]);
+      samplesLum.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
     }
   }
-  const avgBorderLum = borderCount > 0 ? borderSum / borderCount : 128;
-  const isDarkBackdrop = avgBorderLum < 28;
-
-  if (!isDarkBackdrop) {
-    return { detectBlob: file, origImageData, w, h, isDarkBackdrop: false };
+  for (let x = margin; x < w - margin; x += step) {
+    const i = (margin * w + x) * 4;
+    samplesR.push(data[i]);
+    samplesG.push(data[i + 1]);
+    samplesB.push(data[i + 2]);
+    samplesLum.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
   }
 
-  // Build a lookup table that keeps true black (0..3) at 0, and steeply lifts
-  // dark clothing shadows (4..45 -> 35..175) with a γ=0.36 curve
-  const lut = new Uint8ClampedArray(256);
-  const floor = Math.min(4, Math.floor(avgBorderLum + 2));
-  for (let v = 0; v < 256; v++) {
-    if (v <= floor) {
-      lut[v] = 0;
-    } else {
-      const norm = (v - floor) / (255 - floor);
-      lut[v] = Math.min(255, Math.round(Math.pow(norm, 0.36) * 255));
+  const median = (arr) => {
+    const s = [...arr].sort((a, b) => a - b);
+    return s[Math.floor(s.length / 2)] || 0;
+  };
+  const bgR = median(samplesR);
+  const bgG = median(samplesG);
+  const bgB = median(samplesB);
+  const avgBorderLum = median(samplesLum);
+
+  // Measure median absolute deviation of border color to see if it's a uniform studio backdrop
+  const diffs = samplesR.map(
+    (r, idx) =>
+      Math.abs(r - bgR) +
+      Math.abs(samplesG[idx] - bgG) +
+      Math.abs(samplesB[idx] - bgB)
+  );
+  const madColor = median(diffs);
+  const isPureBlackBackdrop = avgBorderLum < 12 && madColor < 18;
+  const isUniformStudioBackdrop = madColor < 32 && avgBorderLum < 165;
+
+  if (!isPureBlackBackdrop && !isUniformStudioBackdrop) {
+    return {
+      detectBlob: file,
+      origImageData,
+      w,
+      h,
+      isDarkBackdrop: false,
+      isPureBlackBackdrop: false,
+      bgMask: null,
+      telemetry: {
+        dimensions: `${w}x${h}`,
+        mode: "standard-isnet",
+        borderMedianRgb: [bgR, bgG, bgB],
+        borderMadColor: Math.round(madColor * 10) / 10,
+        avgBorderLum: Math.round(avgBorderLum * 10) / 10,
+      },
+    };
+  }
+
+  // Connected exterior flood-fill from top, left, and right edges for studio backdrops
+  // Uses both global distance to local border reference and step-to-step gradient guard
+  const bgMask = new Uint8Array(w * h);
+  const queue = new Int32Array(w * h);
+  let qHead = 0;
+  let qTail = 0;
+  const globalTol = isPureBlackBackdrop ? 6 : Math.max(26, madColor * 2.4);
+  const stepTol = isPureBlackBackdrop ? 3 : 10;
+
+  const trySeed = (x, y) => {
+    const idx = y * w + x;
+    if (bgMask[idx]) return;
+    const i = idx * 4;
+    const dGlobal =
+      Math.abs(data[i] - bgR) +
+      Math.abs(data[i + 1] - bgG) +
+      Math.abs(data[i + 2] - bgB);
+    if (dGlobal <= globalTol * 1.35) {
+      bgMask[idx] = 1;
+      queue[qTail++] = idx;
+    }
+  };
+
+  for (let x = 0; x < w; x++) trySeed(x, 0);
+  for (let y = 0; y < Math.floor(h * 0.82); y++) {
+    trySeed(0, y);
+    trySeed(w - 1, y);
+  }
+
+  while (qHead < qTail) {
+    const curr = queue[qHead++];
+    const cx = curr % w;
+    const cy = (curr - cx) / w;
+    const ci = curr * 4;
+    const cr = data[ci];
+    const cg = data[ci + 1];
+    const cb = data[ci + 2];
+
+    const neighbors = [
+      [cx - 1, cy],
+      [cx + 1, cy],
+      [cx, cy - 1],
+      [cx, cy + 1],
+    ];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+      const nIdx = ny * w + nx;
+      if (bgMask[nIdx]) continue;
+      const ni = nIdx * 4;
+      const nr = data[ni];
+      const ng = data[ni + 1];
+      const nb = data[ni + 2];
+      const dStep = Math.abs(nr - cr) + Math.abs(ng - cg) + Math.abs(nb - cb);
+      if (dStep > stepTol) continue;
+      const dGlobal =
+        Math.abs(nr - bgR) + Math.abs(ng - bgG) + Math.abs(nb - bgB);
+      if (dGlobal <= globalTol) {
+        bgMask[nIdx] = 1;
+        queue[qTail++] = nIdx;
+      }
     }
   }
+
+  // Sample lower-center torso luminance (jacket/shirt area)
+  const torsoLums = [];
+  for (let y = Math.floor(h * 0.72); y < Math.floor(h * 0.96); y += step) {
+    for (let x = Math.floor(w * 0.28); x < Math.floor(w * 0.72); x += step) {
+      const i = (y * w + x) * 4;
+      torsoLums.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+    }
+  }
+  const medianTorsoLum = median(torsoLums);
 
   const boosted = ctx.createImageData(w, h);
   const bData = boosted.data;
-  for (let i = 0; i < data.length; i += 4) {
-    bData[i] = lut[data[i]];
-    bData[i + 1] = lut[data[i + 1]];
-    bData[i + 2] = lut[data[i + 2]];
-    bData[i + 3] = data[i + 3];
+
+  // IMPORTANT:
+  // - On pure-black backdrops (like Brian's where the black jacket is rgb(8,8,8) against rgb(0,0,0)),
+  //   we lift shadows below y = 0.62h so ISNet sees the jacket contour.
+  // - On mid-grey/colored studio backdrops (like Jason's where his face extends down to y = 0.84h),
+  //   we only ramp in the white background swap in the bottom 16% of the frame (y = 0.84h .. 0.90h)
+  //   where the suit shoulders meet the bottom edge, keeping 100% of the head, cheeks, jaw, and ears
+  //   untouched for ISNet's native alpha matting!
+  const rampStartY = Math.floor(h * (isPureBlackBackdrop ? 0.62 : 0.84));
+  const rampEndY = Math.floor(h * (isPureBlackBackdrop ? 0.72 : 0.9));
+  const rampSpan = Math.max(1, rampEndY - rampStartY);
+
+  if (isPureBlackBackdrop) {
+    const lut = new Uint8ClampedArray(256);
+    const floor = 2;
+    for (let v = 0; v < 256; v++) {
+      if (v <= floor) {
+        lut[v] = 0;
+      } else {
+        const norm = (v - floor) / (255 - floor);
+        lut[v] = Math.min(255, Math.round(Math.pow(norm, 0.36) * 255));
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      const weight =
+        y <= rampStartY ? 0 : y >= rampEndY ? 1 : (y - rampStartY) / rampSpan;
+      for (let x = 0; x < w; x++) {
+        const idx = y * w + x;
+        const i = idx * 4;
+        if (weight === 0) {
+          bData[i] = data[i];
+          bData[i + 1] = data[i + 1];
+          bData[i + 2] = data[i + 2];
+          bData[i + 3] = data[i + 3];
+        } else if (bgMask[idx]) {
+          bData[i] = Math.round(data[i] * (1 - weight));
+          bData[i + 1] = Math.round(data[i + 1] * (1 - weight));
+          bData[i + 2] = Math.round(data[i + 2] * (1 - weight));
+          bData[i + 3] = 255;
+        } else {
+          bData[i] = Math.round(data[i] * (1 - weight) + lut[data[i]] * weight);
+          bData[i + 1] = Math.round(data[i + 1] * (1 - weight) + lut[data[i + 1]] * weight);
+          bData[i + 2] = Math.round(data[i + 2] * (1 - weight) + lut[data[i + 2]] * weight);
+          bData[i + 3] = data[i + 3];
+        }
+      }
+    }
+  } else {
+    const fillVal = medianTorsoLum < 120 ? 255 : 0;
+    for (let y = 0; y < h; y++) {
+      const weight =
+        y <= rampStartY ? 0 : y >= rampEndY ? 1 : (y - rampStartY) / rampSpan;
+      for (let x = 0; x < w; x++) {
+        const idx = y * w + x;
+        const i = idx * 4;
+        if (weight > 0 && bgMask[idx]) {
+          bData[i] = Math.round(data[i] * (1 - weight) + fillVal * weight);
+          bData[i + 1] = Math.round(data[i + 1] * (1 - weight) + fillVal * weight);
+          bData[i + 2] = Math.round(data[i + 2] * (1 - weight) + fillVal * weight);
+          bData[i + 3] = 255;
+        } else {
+          bData[i] = data[i];
+          bData[i + 1] = data[i + 1];
+          bData[i + 2] = data[i + 2];
+          bData[i + 3] = data[i + 3];
+        }
+      }
+    }
   }
+
+  let bgCount = 0;
+  for (let i = 0; i < bgMask.length; i++) if (bgMask[i]) bgCount++;
+
   ctx.putImageData(boosted, 0, 0);
   const detectBlob = await new Promise((resolve) =>
     canvas.toBlob(resolve, "image/png")
   );
-  return { detectBlob, origImageData, w, h, isDarkBackdrop: true };
+  return {
+    detectBlob,
+    origImageData,
+    w,
+    h,
+    isDarkBackdrop: true,
+    isPureBlackBackdrop,
+    bgRgb: [bgR, bgG, bgB],
+    bgMask,
+    telemetry: {
+      dimensions: `${w}x${h}`,
+      mode: isPureBlackBackdrop
+        ? "pure-black-backdrop"
+        : "uniform-studio-backdrop",
+      borderMedianRgb: [bgR, bgG, bgB],
+      borderMadColor: Math.round(madColor * 10) / 10,
+      avgBorderLum: Math.round(avgBorderLum * 10) / 10,
+      medianTorsoLum: Math.round(medianTorsoLum * 10) / 10,
+      floodFilledBgPct: Math.round((bgCount / (w * h)) * 1000) / 10,
+      shoulderRampY: [rampStartY, rampEndY],
+    },
+  };
 }
 
 /**
- * Composite the segmentation mask onto the ORIGINAL unmodified pixels.
- * When `isDarkBackdrop` is true (studio portrait on a pure black 0..2 backdrop),
- * we also scan each horizontal row for the outermost non-black subject span
- * (`lum >= 2`) from the neck/shoulders down, and fill everything inside `[leftEdge..rightEdge]`
- * at alpha = 255. That prevents ISNet from chopping off dark sleeves or leaving
- * semi-transparent purple bleed-through when a dark jacket is crushed to near-black.
+ * Composite the segmentation mask onto the ORIGINAL pixels, with:
+ * 1. Dynamic neck/shoulder waist detection so close-up headshots (like Jason's)
+ *    never apply shoulder-span rules across the cheek or jaw.
+ * 2. Edge color decontamination (de-spill) + grey-fringe alpha tightening along
+ *    semi-transparent face/hair/glasses edges (`0 < alpha < 248`) so studio wall
+ *    color (`[62, 62, 66]`) never shows as a rough halo over the purple cover.
  */
-async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdrop) {
+async function compositeCleanCutout(
+  maskBlob,
+  origImageData,
+  w,
+  h,
+  isDarkBackdrop,
+  isPureBlackBackdrop,
+  bgRgb,
+  bgMask,
+  detectBlob
+) {
   const maskImg = await loadImageFromBlob(maskBlob);
   const canvas = document.createElement("canvas");
   canvas.width = w;
@@ -385,33 +694,44 @@ async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdro
   const out = ctx.createImageData(w, h);
   const dst = out.data;
 
-  // Build row-wise silhouette span `[rowLeft[y], rowRight[y]]` for dark backdrops
+  // Dynamically find where the shoulders flare out below the head/chin:
+  // On pure-black backdrops (Brian), start around 0.64h; on grey studio close-ups (Jason),
+  // start at 0.85h (bottom 15% of frame) so the face/jawline is 100% governed by ISNet + de-spill.
+  const shoulderStartY = Math.floor(h * (isPureBlackBackdrop ? 0.64 : 0.85));
+  const shoulderFullY = Math.floor(h * (isPureBlackBackdrop ? 0.72 : 0.91));
+  const shoulderRamp = Math.max(1, shoulderFullY - shoulderStartY);
+  const erodePx = isPureBlackBackdrop ? 0 : 4;
+
   const rowLeft = new Int32Array(h).fill(w);
   const rowRight = new Int32Array(h).fill(-1);
   if (isDarkBackdrop) {
-    for (let y = 0; y < h; y++) {
+    for (let y = shoulderStartY; y < h; y++) {
       let l = w;
       let r = -1;
       for (let x = 0; x < w; x++) {
-        const idx = (y * w + x) * 4;
-        const lum = Math.max(orig[idx], orig[idx + 1], orig[idx + 2]);
+        const pIdx = y * w + x;
+        const idx = pIdx * 4;
         const mA = maskData[idx + 3];
-        if (lum >= 2 || mA >= 80) {
+        const isNotBg = bgMask ? !bgMask[pIdx] : mA >= 80;
+        if (isNotBg || mA >= 80) {
           if (x < l) l = x;
           if (x > r) r = x;
         }
       }
-      rowLeft[y] = l;
-      rowRight[y] = r;
+      if (r - l > erodePx * 2) {
+        rowLeft[y] = l + erodePx;
+        rowRight[y] = r - erodePx;
+      }
     }
-    // Smooth the row boundaries with a 9-row moving median/average so JPEG blocks don't stair-step
-    const smoothL = new Int32Array(h);
-    const smoothR = new Int32Array(h);
-    for (let y = 0; y < h; y++) {
-      let sumL = 0, sumR = 0, cnt = 0;
-      for (let dy = -4; dy <= 4; dy++) {
+    const smoothL = new Int32Array(h).fill(w);
+    const smoothR = new Int32Array(h).fill(-1);
+    for (let y = shoulderStartY; y < h; y++) {
+      let sumL = 0,
+        sumR = 0,
+        cnt = 0;
+      for (let dy = -5; dy <= 5; dy++) {
         const ny = y + dy;
-        if (ny >= 0 && ny < h && rowRight[ny] >= rowLeft[ny]) {
+        if (ny >= shoulderStartY && ny < h && rowRight[ny] >= rowLeft[ny]) {
           sumL += rowLeft[ny];
           sumR += rowRight[ny];
           cnt++;
@@ -424,48 +744,136 @@ async function compositeCleanCutout(maskBlob, origImageData, w, h, isDarkBackdro
     rowRight.set(smoothR);
   }
 
+  const [bgR, bgG, bgB] = bgRgb || [0, 0, 0];
   const lowCut = 18;
-  const highCut = 120;
+  const highCut = 140;
   const span = highCut - lowCut;
-  const feather = 4; // 4px anti-aliased edge on the horizontal span
+  const feather = 6;
 
   for (let y = 0; y < h; y++) {
     const lEdge = rowLeft[y];
     const rEdge = rowRight[y];
-    const hasSpan = isDarkBackdrop && rEdge >= lEdge;
+    const inShoulderZone = isDarkBackdrop && y >= shoulderStartY && rEdge >= lEdge;
+    const zoneWeight = !inShoulderZone
+      ? 0
+      : y >= shoulderFullY
+        ? 1
+        : (y - shoulderStartY) / shoulderRamp;
 
     for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      dst[i] = orig[i];
-      dst[i + 1] = orig[i + 1];
-      dst[i + 2] = orig[i + 2];
-
+      const pIdx = y * w + x;
+      const i = pIdx * 4;
+      let r = orig[i];
+      let g = orig[i + 1];
+      let b = orig[i + 2];
       const a = maskData[i + 3];
-      let maskAlpha = 0;
-      if (a <= lowCut) {
-        maskAlpha = 0;
-      } else if (a >= highCut) {
-        maskAlpha = 255;
+
+      let finalAlpha = a;
+
+      if (!inShoulderZone) {
+        // Head, face, glasses, hair:
+        // If connected flood-fill proved this pixel is backdrop AND ISNet alpha is weak/medium (< 185),
+        // strip it so grey studio backdrop never clings to the side of the cheek/ear!
+        if (bgMask && bgMask[pIdx] && a < 185) {
+          finalAlpha = 0;
+        } else if (a <= 14) {
+          finalAlpha = 0;
+        } else if (isDarkBackdrop && !isPureBlackBackdrop && a < 245) {
+          // Check how close this semi-transparent edge pixel is to the studio backdrop color `[bgR, bgG, bgB]`
+          const dBg = Math.abs(r - bgR) + Math.abs(g - bgG) + Math.abs(b - bgB);
+          let alphaNorm = a / 255;
+          if (dBg < 48) {
+            // Tighten alpha on pixels that are mostly studio-wall grey so the rough fringe disappears
+            const choke = 1.9 - (dBg / 48) * 0.7;
+            alphaNorm = Math.pow(alphaNorm, choke);
+          }
+          finalAlpha = alphaNorm < 0.06 ? 0 : Math.min(255, Math.round(alphaNorm * 255));
+
+          // Color decontamination (unmix studio backdrop color `[bgR, bgG, bgB]` from edge pixels)
+          if (finalAlpha > 0 && finalAlpha < 242) {
+            const effA = Math.max(0.28, finalAlpha / 255);
+            r = Math.max(0, Math.min(255, Math.round((r - (1 - effA) * bgR) / effA)));
+            g = Math.max(0, Math.min(255, Math.round((g - (1 - effA) * bgG) / effA)));
+            b = Math.max(0, Math.min(255, Math.round((b - (1 - effA) * bgB) / effA)));
+          }
+        }
       } else {
-        const t = (a - lowCut) / span;
-        maskAlpha = Math.round(t * t * (3 - 2 * t) * 255);
+        // Lower shoulder/jacket zone:
+        if (bgMask && bgMask[pIdx] && a < 210) {
+          finalAlpha = 0;
+        } else {
+          let maskAlpha = 0;
+          if (a <= lowCut) {
+            maskAlpha = 0;
+          } else if (a >= highCut) {
+            maskAlpha = 255;
+          } else {
+            const t = (a - lowCut) / span;
+            maskAlpha = Math.round(t * t * (3 - 2 * t) * 255);
+          }
+
+          if (x >= lEdge && x <= rEdge) {
+            const distToEdge = Math.min(x - lEdge, rEdge - x);
+            const spanAlpha =
+              distToEdge >= feather
+                ? 255
+                : Math.round(((distToEdge + 1) / (feather + 1)) * 255);
+            const targetAlpha = Math.max(maskAlpha, spanAlpha);
+            finalAlpha = Math.round(a * (1 - zoneWeight) + targetAlpha * zoneWeight);
+          } else {
+            finalAlpha = Math.round(a * (1 - zoneWeight) + maskAlpha * zoneWeight);
+          }
+        }
       }
 
-      if (hasSpan && x >= lEdge && x <= rEdge) {
-        const distToEdge = Math.min(x - lEdge, rEdge - x);
-        const spanAlpha =
-          distToEdge >= feather
-            ? 255
-            : Math.round(((distToEdge + 1) / (feather + 1)) * 255);
-        dst[i + 3] = Math.max(maskAlpha, spanAlpha);
-      } else {
-        dst[i + 3] = maskAlpha;
-      }
+      dst[i] = r;
+      dst[i + 1] = g;
+      dst[i + 2] = b;
+      dst[i + 3] = finalAlpha;
     }
   }
 
   ctx.putImageData(out, 0, 0);
-  return new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+  const cleanBlob = await new Promise((resolve) =>
+    canvas.toBlob(resolve, "image/png")
+  );
+
+  // Build a 3-panel diagnostic stage strip (1: Pre-pass input, 2: Raw ISNet mask, 3: Final cutout on purple)
+  let stagesDataUrl = null;
+  if (IS_DEBUG_ENABLED && detectBlob) {
+    try {
+      const detectImg = await loadImageFromBlob(detectBlob);
+      const cleanImg = await loadImageFromBlob(cleanBlob);
+      const thumbH = 220;
+      const thumbW = Math.round((w / h) * thumbH);
+      const strip = document.createElement("canvas");
+      strip.width = thumbW * 3 + 16;
+      strip.height = thumbH + 26;
+      const sctx = strip.getContext("2d");
+      sctx.fillStyle = "#12102c";
+      sctx.fillRect(0, 0, strip.width, strip.height);
+
+      // Panel 1: Pre-pass input to ISNet
+      sctx.drawImage(detectImg, 0, 24, thumbW, thumbH);
+      // Panel 2: Raw ISNet mask
+      sctx.drawImage(maskImg, thumbW + 8, 24, thumbW, thumbH);
+      // Panel 3: Final cutout over WPPT purple
+      sctx.fillStyle = "#5e53c0";
+      sctx.fillRect((thumbW + 8) * 2, 24, thumbW, thumbH);
+      sctx.drawImage(cleanImg, (thumbW + 8) * 2, 24, thumbW, thumbH);
+
+      sctx.fillStyle = "#ffffff";
+      sctx.font = "600 11px system-ui, sans-serif";
+      sctx.fillText("1. ISNet Pre-pass", 6, 16);
+      sctx.fillText("2. Raw ISNet Output", thumbW + 14, 16);
+      sctx.fillText("3. Final Cutout", (thumbW + 8) * 2 + 6, 16);
+      stagesDataUrl = strip.toDataURL("image/png");
+    } catch {
+      /* ignore stage strip error */
+    }
+  }
+
+  return { cleanBlob, stagesDataUrl };
 }
 
 async function runCutoutLocal(file) {
@@ -477,10 +885,20 @@ async function runCutoutLocal(file) {
   btnApply.disabled = true;
   broadcastCutoutProcessing(true);
   setStatus("Removing background locally (full-precision ISNet)…");
+  const t0 = performance.now();
   try {
-    const { detectBlob, origImageData, w, h, isDarkBackdrop } =
-      await buildShadowBoostedInput(file);
-    const rawCutoutBlob = await removeBackground(detectBlob, {
+    const {
+      detectBlob,
+      origImageData,
+      w,
+      h,
+      isDarkBackdrop,
+      isPureBlackBackdrop,
+      bgRgb,
+      bgMask,
+      telemetry,
+    } = await buildShadowBoostedInput(file);
+    const { cleanBlob, stagesDataUrl } = await removeBackground(detectBlob, {
       model: "medium",
       output: { format: "image/png", quality: 1 },
       progress: (key, current, total) => {
@@ -488,21 +906,35 @@ async function runCutoutLocal(file) {
           setStatus(`Cutout: ${key} ${Math.round((current / total) * 100)}%`);
         }
       },
-    });
-    const cleanBlob = await compositeCleanCutout(
-      rawCutoutBlob,
-      origImageData,
-      w,
-      h,
-      isDarkBackdrop
+    }).then((rawCutoutBlob) =>
+      compositeCleanCutout(
+        rawCutoutBlob,
+        origImageData,
+        w,
+        h,
+        isDarkBackdrop,
+        isPureBlackBackdrop,
+        bgRgb,
+        bgMask,
+        detectBlob
+      )
     );
     revokeGuestUrl();
     guestObjectUrl = URL.createObjectURL(cleanBlob);
     guestSrc = guestObjectUrl;
     broadcast();
+
+    debugState.cutout = {
+      ...telemetry,
+      durationMs: Math.round(performance.now() - t0),
+    };
+    updateDebugUI(
+      stagesDataUrl ? { cutoutStagesDataUrl: stagesDataUrl } : {}
+    );
+
     setStatus(
       isDarkBackdrop
-        ? "Cutout applied (shadow-boosted mask for dark backdrop)."
+        ? "Cutout applied (head-safe studio backdrop boost)."
         : "Cutout applied."
     );
   } catch (err) {
@@ -512,6 +944,56 @@ async function runCutoutLocal(file) {
     btnCutoutLocal.disabled = false;
     btnApply.disabled = false;
   }
+}
+
+/**
+ * Extract exact rendered line strings and coordinates from a DOM element
+ * using Range.getClientRects(), so canvas export matches CSS text-wrap: balance 1:1.
+ */
+function extractRenderedLines(el, toLogicalRect) {
+  const doc = el.ownerDocument;
+  const lines = [];
+  const walker = doc.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  const range = doc.createRange();
+  let currentLine = null;
+
+  let textNode;
+  while ((textNode = walker.nextNode())) {
+    const str = textNode.nodeValue || "";
+    for (let i = 0; i < str.length; i++) {
+      const ch = str[i];
+      if (ch === "\r" || ch === "\n") continue;
+      range.setStart(textNode, i);
+      range.setEnd(textNode, i + 1);
+      const rects = range.getClientRects();
+      if (!rects.length) continue;
+      const r = toLogicalRect(rects[0]);
+      if (r.width === 0 && r.height === 0 && ch.trim() === "") continue;
+
+      if (!currentLine || Math.abs(r.top - currentLine.top) > 10) {
+        if (currentLine) {
+          currentLine.text = currentLine.text.replace(/^\s+|\s+$/g, "");
+          if (currentLine.text) lines.push(currentLine);
+        }
+        currentLine = {
+          text: ch,
+          left: r.left,
+          top: r.top,
+          height: r.height,
+        };
+      } else {
+        currentLine.text += ch;
+        if (r.left < currentLine.left && ch.trim() !== "") {
+          currentLine.left = r.left;
+        }
+      }
+    }
+  }
+  if (currentLine) {
+    currentLine.text = currentLine.text.replace(/^\s+|\s+$/g, "");
+    if (currentLine.text) lines.push(currentLine);
+  }
+  return lines;
 }
 
 async function exportPngClientSide() {
@@ -532,6 +1014,26 @@ async function exportPngClientSide() {
       img.onerror = () => reject(new Error(`Failed to load ${src}`));
       img.src = src;
     });
+
+  // Read live DOM geometry from the preview iframe so export matches preview 1:1
+  const iframeDoc = iframes[0]?.contentDocument;
+  const rootEl = iframeDoc?.querySelector("[data-asset-canvas]");
+  const rootRect = rootEl?.getBoundingClientRect();
+  const scaleX = rootRect && rootRect.width > 0 ? rootRect.width / CANVAS_W : 1;
+  const scaleY = rootRect && rootRect.height > 0 ? rootRect.height / CANVAS_H : 1;
+
+  const toLogicalRect = (domRect) => {
+    if (!domRect || !rootRect) return { left: 0, top: 0, width: 0, height: 0, right: 0, bottom: 0 };
+    const left = (domRect.left - rootRect.left) / scaleX;
+    const top = (domRect.top - rootRect.top) / scaleY;
+    const width = domRect.width / scaleX;
+    const height = domRect.height / scaleY;
+    return { left, top, width, height, right: left + width, bottom: top + height };
+  };
+  const rectOf = (sel) => {
+    const el = iframeDoc?.querySelector(sel);
+    return el ? toLogicalRect(el.getBoundingClientRect()) : null;
+  };
 
   // 1. Background gradient (118deg-ish diagonal)
   const angleRad = ((118 - 90) * Math.PI) / 180;
@@ -598,7 +1100,7 @@ async function exportPngClientSide() {
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
 
-  // 2. Overlay pattern
+  // 2. Overlay pattern + radial vignette
   const patSpec = OVERLAY_PATTERNS.find((p) => p.id === selectedPatternId);
   if (patSpec?.preview) {
     try {
@@ -630,134 +1132,191 @@ async function exportPngClientSide() {
     }
   }
 
-  // 3. White featured card (inset 40px 44px, max-width 58% = 742.4px)
-  const cardX = 44;
-  const cardY = 40;
-  const cardW = Math.round(CANVAS_W * 0.58);
-  const cardH = CANVAS_H - 80;
+  // Vignette matching .wpep-vignette
+  ctx.save();
+  const vig = ctx.createRadialGradient(
+    CANVAS_W * 0.7,
+    CANVAS_H * 0.5,
+    CANVAS_W * 0.28,
+    CANVAS_W * 0.7,
+    CANVAS_H * 0.5,
+    CANVAS_W * 0.85
+  );
+  vig.addColorStop(0, "rgba(23, 19, 41, 0)");
+  vig.addColorStop(1, "rgba(23, 19, 41, 0.45)");
+  ctx.fillStyle = vig;
+  ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+  ctx.restore();
+
+  // 3. White featured card (from live DOM rect)
+  const cardR = rectOf(".wpep-card") || {
+    left: 44,
+    top: 34,
+    width: Math.round(CANVAS_W * 0.62),
+    height: CANVAS_H - 68,
+  };
   ctx.save();
   ctx.shadowColor = "rgba(56, 48, 127, 0.35)";
   ctx.shadowBlur = 48;
   ctx.shadowOffsetY = 18;
   ctx.fillStyle = "#ffffff";
   ctx.beginPath();
-  ctx.roundRect(cardX, cardY, cardW, cardH, 18);
+  ctx.roundRect(cardR.left, cardR.top, cardR.width, cardR.height, 18);
   ctx.fill();
   ctx.restore();
 
-  // 4. Wordmark in top-left (height 44px matching combined height of EPISODE + LIVE badge)
+  // 4. Wordmark in top-left (from live DOM rect)
+  const wmR = rectOf(".wpep-wordmark") || { left: cardR.left + 42, top: cardR.top + 28, width: 218, height: 58 };
   const wordmarkUrl = "./cover/assets/wppt-wordmark.svg";
   try {
     const wmImg = await loadImg(wordmarkUrl);
-    const wmH = 44;
-    const wmW = (wmImg.naturalWidth / wmImg.naturalHeight) * wmH || 166;
-    ctx.drawImage(wmImg, cardX + 40, cardY + 32, wmW, wmH);
+    ctx.drawImage(wmImg, wmR.left, wmR.top, wmR.width, wmR.height);
   } catch {
     /* ignore */
   }
 
-  // 5. Top-right Episode text (no pill background) + LIVE badge (combined height = 44px)
+  // 5. Right-aligned inline EPISODE pill + LIVE! badge (from live DOM rects)
   const fp = fieldPayload();
+  const epR = rectOf(".wpep-eyebrow");
+  const liveR = rectOf(".wpep-live");
   ctx.save();
-  ctx.font = '700 13.1px "Noto Sans", system-ui, sans-serif';
-  const epText = fp.eyebrow.toUpperCase();
-  ctx.fillStyle = "#38307f";
-  ctx.textAlign = "right";
-  ctx.textBaseline = "top";
-  ctx.fillText(epText, cardX + cardW - 40, cardY + 32);
-
-  const liveW = 48;
-  const liveH = 22;
-  const liveX = cardX + cardW - 40 - liveW;
-  const liveY = cardY + 32 + 44 - liveH;
-  ctx.fillStyle = "#e11d48";
-  ctx.beginPath();
-  ctx.roundRect(liveX, liveY, liveW, liveH, 4);
-  ctx.fill();
-  ctx.fillStyle = "#ffffff";
-  ctx.font = '800 11.5px "Noto Sans", system-ui, sans-serif';
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(fp.live, liveX + liveW / 2, liveY + liveH / 2 + 1);
+  if (epR) {
+    ctx.fillStyle = "rgba(94, 83, 192, 0.14)";
+    ctx.beginPath();
+    ctx.roundRect(epR.left, epR.top, epR.width, epR.height, 999);
+    ctx.fill();
+    ctx.fillStyle = "#38307f";
+    ctx.font = '800 18.9px "Noto Sans", system-ui, sans-serif';
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText(fp.eyebrow.toUpperCase(), epR.left + epR.width / 2, epR.top + epR.height / 2 + 1);
+  }
+  if (liveR) {
+    ctx.fillStyle = "#e11d48";
+    ctx.beginPath();
+    ctx.roundRect(liveR.left, liveR.top, liveR.width, liveR.height, 8);
+    ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath();
+    ctx.arc(liveR.left + 17.6 + 5.2, liveR.top + liveR.height / 2, 5.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.font = '800 18.9px "Noto Sans", system-ui, sans-serif';
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(fp.live, liveR.left + 17.6 + 10.4 + 8, liveR.top + liveR.height / 2 + 1);
+  }
   ctx.restore();
 
-  // 6. Title + Guest line + Sparkles
+  // 6. Title + Yellow Swash + Guest line + Sparkles (exact lines & positions from live DOM)
   ctx.save();
-  ctx.fillStyle = "#171329";
-  ctx.font = '700 44px "Noto Sans", system-ui, sans-serif';
-  ctx.textBaseline = "top";
-  const maxTitleW = cardW - 80;
-  const words = fp.title.split(/\s+/);
-  const lines = [];
-  let cur = "";
-  for (const word of words) {
-    const test = cur ? `${cur} ${word}` : word;
-    if (ctx.measureText(test).width > maxTitleW && cur) {
-      lines.push(cur);
-      cur = word;
-    } else {
-      cur = test;
+  const titleEl = iframeDoc?.querySelector(".wpep-title");
+  let exportedTitleLines = [];
+  let exportedTitleFontPx = 66;
+  let titleStepTrace = [];
+  if (titleEl) {
+    const cs = iframeDoc.defaultView.getComputedStyle(titleEl);
+    exportedTitleFontPx = parseFloat(cs.fontSize) || 66;
+    try {
+      titleStepTrace = JSON.parse(titleEl.dataset.fitTrace || "[]");
+    } catch {
+      titleStepTrace = [];
+    }
+    ctx.font = `700 ${exportedTitleFontPx}px "Noto Sans", system-ui, sans-serif`;
+    ctx.fillStyle = "#171329";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const domLines = extractRenderedLines(titleEl, toLogicalRect);
+    exportedTitleLines = domLines.map((ln) => ({
+      text: ln.text,
+      left: Math.round(ln.left * 10) / 10,
+      top: Math.round(ln.top * 10) / 10,
+      widthPx: Math.round(ctx.measureText(ln.text).width),
+    }));
+    for (const ln of domLines) {
+      ctx.fillText(ln.text, ln.left, ln.top);
     }
   }
-  if (cur) lines.push(cur);
 
-  let textY = cardY + 178;
-  for (const line of lines) {
-    ctx.fillText(line, cardX + 40, textY);
-    textY += 47.5;
+  const swashR = rectOf(".wpep-swash");
+  if (swashR && swashR.width > 0) {
+    const swashSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="360" height="18" viewBox="0 0 360 18" fill="none"><path d="M4 13.5 C86 3.2, 224 2.4, 356 12.2 C252 7.8, 114 8.4, 18 15.6 C10 16.1, 3 14.8, 4 13.5 Z" fill="#FED000"/></svg>`;
+    try {
+      const swImg = await loadImg(
+        `data:image/svg+xml;charset=utf-8,${encodeURIComponent(swashSvg)}`
+      );
+      ctx.drawImage(swImg, swashR.left, swashR.top, swashR.width, swashR.height);
+    } catch {
+      /* ignore */
+    }
   }
 
-  textY += 10;
-  ctx.font = '600 18px "Noto Sans", system-ui, sans-serif';
-  ctx.fillStyle = "#4a5568";
-  const prefix = "with special guest: ";
-  ctx.fillText(prefix, cardX + 40, textY + 6);
-  const prefixW = ctx.measureText(prefix).width;
+  const prefixEl = iframeDoc?.querySelector(".wpep-lede__prefix");
+  const prefixR = rectOf(".wpep-lede__prefix");
+  if (prefixEl && prefixR) {
+    const pCs = iframeDoc.defaultView.getComputedStyle(prefixEl);
+    const pPx = parseFloat(pCs.fontSize) || 21.6;
+    ctx.font = `600 ${pPx}px "Noto Sans", system-ui, sans-serif`;
+    ctx.fillStyle = "#4a5568";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    ctx.fillText(fp.guestPrefix || "with special guest:", prefixR.left, prefixR.top);
+  }
 
-  ctx.font = '800 26.4px "Noto Sans", system-ui, sans-serif';
-  ctx.fillStyle = "#38307f";
-  const nameX = cardX + 40 + prefixW;
-  ctx.fillText(fp.guestName, nameX, textY);
-  const nameW = ctx.measureText(fp.guestName).width;
+  const nameEl = iframeDoc?.querySelector(".wpep-lede__name");
+  if (nameEl) {
+    const nCs = iframeDoc.defaultView.getComputedStyle(nameEl);
+    const nPx = parseFloat(nCs.fontSize) || 36.8;
+    ctx.font = `800 ${nPx}px "Noto Sans", system-ui, sans-serif`;
+    ctx.fillStyle = "#38307f";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "top";
+    const nameLines = extractRenderedLines(nameEl, toLogicalRect);
+    for (const ln of nameLines) {
+      ctx.fillText(ln.text, ln.left, ln.top);
+    }
+  }
 
-  // Draw the AuroraText-style 4-point sparkles over/right of the guest name
-  const sparkleSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="180" height="54" viewBox="0 0 180 54" fill="none">
-    <g transform="translate(18 8) rotate(-14) scale(0.95)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
-    <g transform="translate(68 42) rotate(12) scale(0.55)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
-    <g transform="translate(106 10) rotate(-18) scale(0.85)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
-    <g transform="translate(124 41) rotate(16) scale(1.08)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
-    <g transform="translate(154 22) rotate(-10) scale(0.78)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#a81de9"/></g>
-    <g transform="translate(169 37) rotate(22) scale(0.48)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
-    <g transform="translate(142 8) rotate(8) scale(0.42)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
-  </svg>`;
-  try {
-    const spImg = await loadImg(
-      `data:image/svg+xml;charset=utf-8,${encodeURIComponent(sparkleSvg)}`
-    );
-    const spW = 168;
-    const spH = 49.6;
-    const spX = nameX + nameW + 38.4 + 2.4 - spW;
-    const spY = textY + 16.5 - spH * 0.54;
-    ctx.drawImage(spImg, spX, spY, spW, spH);
-  } catch {
-    /* ignore */
+  const spR = rectOf(".wpep-lede__sparkles");
+  if (spR && spR.width > 0) {
+    const sparkleSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="180" height="54" viewBox="0 0 180 54" fill="none">
+      <g transform="translate(18 8) rotate(-14) scale(0.95)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+      <g transform="translate(68 42) rotate(12) scale(0.55)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+      <g transform="translate(106 10) rotate(-18) scale(0.85)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+      <g transform="translate(124 41) rotate(16) scale(1.08)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+      <g transform="translate(154 22) rotate(-10) scale(0.78)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#a81de9"/></g>
+      <g transform="translate(169 37) rotate(22) scale(0.48)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#7c5ce6"/></g>
+      <g transform="translate(142 8) rotate(8) scale(0.42)"><path d="M0 -9 C1.8 -1.8 1.8 -1.8 9 0 C1.8 1.8 1.8 1.8 0 9 C-1.8 1.8 -1.8 1.8 -9 0 C-1.8 -1.8 -1.8 -1.8 0 -9Z" fill="#e879a8"/></g>
+    </svg>`;
+    try {
+      const spImg = await loadImg(
+        `data:image/svg+xml;charset=utf-8,${encodeURIComponent(sparkleSvg)}`
+      );
+      ctx.drawImage(spImg, spR.left, spR.top, spR.width, spR.height);
+    } catch {
+      /* ignore */
+    }
   }
   ctx.restore();
 
-  // 7. Co-hosts section
-  const cohosts = selectedCohosts();
-  if (cohosts.length > 0) {
-    const ruleY = textY + 58;
+  // 7. Co-hosts section (exact positions from live DOM)
+  const cohostsWrapEl = iframeDoc?.getElementById("wppt-cohosts-wrap");
+  if (cohostsWrapEl && !cohostsWrapEl.hidden) {
+    const wrapR = toLogicalRect(cohostsWrapEl.getBoundingClientRect());
     ctx.strokeStyle = "rgba(56, 48, 127, 0.2)";
     ctx.lineWidth = 1;
     ctx.beginPath();
-    ctx.moveTo(cardX + 40, ruleY);
-    ctx.lineTo(cardX + cardW - 40, ruleY);
+    ctx.moveTo(wrapR.left, wrapR.top);
+    ctx.lineTo(wrapR.right, wrapR.top);
     ctx.stroke();
 
-    ctx.fillStyle = "#4a5568";
-    ctx.font = '700 12.5px "Noto Sans", system-ui, sans-serif';
-    ctx.fillText("WITH CO-HOSTS:", cardX + 40, ruleY + 24);
+    const labelR = rectOf(".wpep-cohosts-label");
+    if (labelR) {
+      ctx.fillStyle = "#4a5568";
+      ctx.font = '800 14.7px "Noto Sans", system-ui, sans-serif';
+      ctx.textAlign = "left";
+      ctx.textBaseline = "top";
+      ctx.fillText("WITH CO-HOSTS:", labelR.left, labelR.top);
+    }
 
     const ringColors = {
       matt: "#38307f",
@@ -765,85 +1324,161 @@ async function exportPngClientSide() {
       zack: "#a81de9",
       ian: "#fed000",
     };
-    const startY = ruleY + 48;
-    let curX = cardX + 40;
-    let curY = startY;
-    for (let i = 0; i < cohosts.length; i++) {
+    const cohosts = selectedCohosts();
+    const domCohosts = [...iframeDoc.querySelectorAll(".wpep-cohost")];
+    for (let i = 0; i < domCohosts.length; i++) {
+      const itemEl = domCohosts[i];
       const hObj = cohosts[i];
-      if (cohosts.length >= 4 && i === 2) {
-        curX = cardX + 40;
-        curY = startY + 68;
-      }
-      ctx.save();
-      ctx.beginPath();
-      ctx.arc(curX + 28, curY + 28, 28, 0, Math.PI * 2);
-      ctx.fillStyle = ringColors[hObj.id] || "#38307f";
-      ctx.fill();
-      ctx.clip();
-      try {
-        const hImg = await loadImg(hObj.photo);
-        ctx.drawImage(hImg, curX, curY, 56, 56);
-      } catch {
-        /* ignore */
-      }
-      ctx.restore();
+      if (!hObj) continue;
 
-      ctx.fillStyle = "#171329";
-      ctx.font = '700 15.7px "Noto Sans", system-ui, sans-serif';
-      ctx.textBaseline = "middle";
-      ctx.fillText(hObj.name, curX + 65, curY + 28);
-      curX += 65 + ctx.measureText(hObj.name).width + 20;
+      if (domCohosts.length < 4 && i > 0) {
+        const itemR = toLogicalRect(itemEl.getBoundingClientRect());
+        ctx.strokeStyle = "rgba(56, 48, 127, 0.2)";
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(itemR.left, itemR.top + 6);
+        ctx.lineTo(itemR.left, itemR.bottom - 6);
+        ctx.stroke();
+      }
+
+      const ringEl = itemEl.querySelector(".wpep-cohost__ring");
+      const nameEl = itemEl.querySelector(".wpep-cohost__name");
+      if (ringEl) {
+        const rRect = toLogicalRect(ringEl.getBoundingClientRect());
+        const rad = rRect.width / 2;
+        ctx.save();
+        ctx.beginPath();
+        ctx.arc(rRect.left + rad, rRect.top + rad, rad, 0, Math.PI * 2);
+        ctx.fillStyle = ringColors[hObj.id] || "#38307f";
+        ctx.fill();
+        ctx.clip();
+        try {
+          const hImg = await loadImg(hObj.photo);
+          ctx.drawImage(hImg, rRect.left, rRect.top, rRect.width, rRect.height);
+        } catch {
+          /* ignore */
+        }
+        ctx.restore();
+      }
+      if (nameEl) {
+        const nRect = toLogicalRect(nameEl.getBoundingClientRect());
+        const nCs = iframeDoc.defaultView.getComputedStyle(nameEl);
+        const nPx = parseFloat(nCs.fontSize) || 18.4;
+        ctx.fillStyle = "#171329";
+        ctx.font = `700 ${nPx}px "Noto Sans", system-ui, sans-serif`;
+        ctx.textAlign = "left";
+        ctx.textBaseline = "middle";
+        ctx.fillText(hObj.name, nRect.left, nRect.top + nRect.height / 2);
+      }
     }
   }
 
-  // 8. Footer bar + date
-  const footY = cardY + cardH - 54;
-  ctx.strokeStyle = "rgba(56, 48, 127, 0.2)";
-  ctx.beginPath();
-  ctx.moveTo(cardX + 40, footY);
-  ctx.lineTo(cardX + cardW - 40, footY);
-  ctx.stroke();
+  // 8. Footer bar + date (from live DOM rects)
+  const footR = rectOf(".wpep-foot");
+  if (footR) {
+    ctx.strokeStyle = "rgba(56, 48, 127, 0.2)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(footR.left, footR.top);
+    ctx.lineTo(footR.right, footR.top);
+    ctx.stroke();
+  }
 
-  const barX = cardX + 40;
-  const barY = footY + 22;
-  ctx.save();
-  ctx.beginPath();
-  ctx.roundRect(barX, barY, 120, 10, 999);
-  ctx.clip();
-  ctx.fillStyle = "#5e53c0";
-  ctx.fillRect(barX, barY, 70, 10);
-  ctx.fillStyle = "#fed000";
-  ctx.fillRect(barX + 70, barY, 29, 10);
-  ctx.fillStyle = "#a81de9";
-  ctx.fillRect(barX + 99, barY, 21, 10);
-  ctx.restore();
+  const barR = rectOf(".wpep-bar");
+  if (barR) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.roundRect(barR.left, barR.top, barR.width, barR.height, 999);
+    ctx.clip();
+    const w1 = barR.width * 0.58;
+    const w2 = barR.width * 0.24;
+    const w3 = barR.width - w1 - w2;
+    ctx.fillStyle = "#5e53c0";
+    ctx.fillRect(barR.left, barR.top, w1, barR.height);
+    ctx.fillStyle = "#fed000";
+    ctx.fillRect(barR.left + w1, barR.top, w2, barR.height);
+    ctx.fillStyle = "#a81de9";
+    ctx.fillRect(barR.left + w1 + w2, barR.top, w3, barR.height);
+    ctx.restore();
+  }
 
-  ctx.fillStyle = "#171329";
-  ctx.font = '700 15.2px "Noto Sans", system-ui, sans-serif';
-  ctx.textBaseline = "middle";
-  ctx.fillText(fp.date, barX + 134, barY + 5);
+  const dateR = rectOf(".wpep-foot .wpep-meta");
+  if (dateR) {
+    ctx.fillStyle = "#171329";
+    ctx.font = '700 18.4px "Noto Sans", system-ui, sans-serif';
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillText(fp.date, dateR.left, dateR.top + dateR.height / 2);
+  }
 
-  // 9. Guest photo on right
+  // 9. Guest photo on right (exact rendered rect from live DOM #wppt-guest)
   const gSrc = guestSrc || "./cover/assets/guest-placeholder.svg";
+  const guestImgR = rectOf("#wppt-guest");
+  let guestExportDraw = null;
   try {
     const gImg = await loadImg(gSrc);
-    const boxW = CANVAS_W * 0.5 - 20;
-    const boxH = CANVAS_H * 0.94;
-    const scaleFit = Math.min(boxW / gImg.naturalWidth, boxH / gImg.naturalHeight);
-    const drawW = gImg.naturalWidth * scaleFit * (guestOffset.scale || 1);
-    const drawH = gImg.naturalHeight * scaleFit * (guestOffset.scale || 1);
-    const drawX =
-      CANVAS_W - 20 - boxW / 2 - drawW / 2 + (Number(guestOffset.x) || 0);
-    const drawY = CANVAS_H - drawH + (Number(guestOffset.y) || 0);
-    ctx.save();
-    ctx.shadowColor = "rgba(23, 19, 41, 0.35)";
-    ctx.shadowBlur = 28;
-    ctx.shadowOffsetY = 12;
-    ctx.drawImage(gImg, drawX, drawY, drawW, drawH);
-    ctx.restore();
+    if (guestImgR && guestImgR.width > 0 && guestImgR.height > 0) {
+      // Because #wppt-guest uses object-fit: contain; object-position: bottom center;
+      // compute the contained image box inside guestImgR
+      const scaleFit = Math.min(
+        guestImgR.width / gImg.naturalWidth,
+        guestImgR.height / gImg.naturalHeight
+      );
+      const drawW = gImg.naturalWidth * scaleFit;
+      const drawH = gImg.naturalHeight * scaleFit;
+      const drawX = guestImgR.left + (guestImgR.width - drawW) / 2;
+      const drawY = guestImgR.bottom - drawH;
+      guestExportDraw = {
+        natural: `${gImg.naturalWidth}x${gImg.naturalHeight}`,
+        domRect: {
+          left: Math.round(guestImgR.left),
+          top: Math.round(guestImgR.top),
+          width: Math.round(guestImgR.width),
+          height: Math.round(guestImgR.height),
+        },
+        drawnRect: {
+          x: Math.round(drawX),
+          y: Math.round(drawY),
+          w: Math.round(drawW),
+          h: Math.round(drawH),
+        },
+        nudge: { ...guestOffset },
+      };
+      ctx.save();
+      ctx.shadowColor = "rgba(23, 19, 41, 0.35)";
+      ctx.shadowBlur = 28;
+      ctx.shadowOffsetY = 12;
+      ctx.drawImage(gImg, drawX, drawY, drawW, drawH);
+      ctx.restore();
+    }
   } catch {
     /* ignore */
   }
+
+  debugState.layout = {
+    rawTitle: fp.title,
+    titleCharCount: fp.title.length,
+    chosenFontPx: exportedTitleFontPx,
+    lineCount: exportedTitleLines.length,
+    stepTrace: titleStepTrace,
+    renderedLines: exportedTitleLines,
+    cardRect: {
+      left: Math.round(cardR.left),
+      top: Math.round(cardR.top),
+      width: Math.round(cardR.width),
+      height: Math.round(cardR.height),
+    },
+  };
+  debugState.export = {
+    canvasSize: `${w}x${h}`,
+    scaleFactor: Math.round(scaleX * 1000) / 1000,
+    gradient: selectedGradientId,
+    pattern: selectedPatternId,
+    cohostCount: selectedCohosts().length,
+    guest: guestExportDraw,
+  };
+  const exportDataUrl = IS_LOCAL_LAB_SERVER ? canvas.toDataURL("image/png") : undefined;
+  updateDebugUI(exportDataUrl ? { exportDataUrl } : {});
 
   const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
   const name = exportFilename();
@@ -857,53 +1492,8 @@ async function exportPngClientSide() {
 
 async function generatePng() {
   btnGeneratePng.disabled = true;
-  if (!IS_LOCAL_LAB_SERVER) {
-    try {
-      await exportPngClientSide();
-    } catch (err) {
-      setStatus(err.message || String(err), true);
-    } finally {
-      btnGeneratePng.disabled = false;
-    }
-    return;
-  }
-  setStatus("Rendering PNG (headless Chrome)…");
   try {
-    const guestData =
-      guestSrc && !guestSrc.includes("guest-placeholder.svg")
-        ? await blobUrlToDataUrl(guestSrc)
-        : null;
-
-    const res = await fetch("/api/export/png", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        ...broadcastPayload(),
-        guestSrc: guestData,
-        filename: exportFilename(),
-      }),
-    });
-
-    if (!res.ok) {
-      const err = await res.json().catch(() => ({}));
-      const t = formatTiming(err.timing);
-      throw new Error(
-        [err.message || err.error || `Export failed (${res.status})`, t]
-          .filter(Boolean)
-          .join(" ")
-      );
-    }
-
-    const blob = await res.blob();
-    const name = exportFilename();
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = name;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    const timingHdr = res.headers.get("X-Wppt-Timing");
-    const timingNote = timingHdr ? ` (${timingHdr})` : "";
-    setStatus(`Downloaded ${name}.${timingNote}`);
+    await exportPngClientSide();
   } catch (err) {
     setStatus(err.message || String(err), true);
   } finally {

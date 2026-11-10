@@ -459,6 +459,64 @@ body {
   color: var(--cds-danger);
 }
 
+.wppt-lab__debug {
+  margin-top: var(--cds-space-3);
+  padding-top: var(--cds-space-3);
+  border-top: 1px dashed var(--cds-rule);
+  font-size: var(--cds-text-xs);
+}
+
+.wppt-lab__debug[hidden] {
+  display: none;
+}
+
+.wppt-lab__debug-summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: var(--cds-primary-deep);
+  user-select: none;
+}
+
+.wppt-lab__debug-body {
+  margin-top: var(--cds-space-2);
+  display: grid;
+  gap: var(--cds-space-2);
+}
+
+.wppt-lab__debug-actions {
+  display: flex;
+  gap: var(--cds-space-2);
+}
+
+.wppt-lab__debug-btn {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.72rem;
+}
+
+.wppt-lab__debug-img {
+  width: 100%;
+  height: auto;
+  border-radius: var(--cds-radius-sm, 6px);
+  border: 1px solid var(--cds-rule);
+  background: #12102c;
+}
+
+.wppt-lab__debug-pre {
+  margin: 0;
+  padding: var(--cds-space-2);
+  max-height: 14rem;
+  overflow: auto;
+  border-radius: var(--cds-radius-sm, 6px);
+  background: var(--cds-paper);
+  border: 1px solid var(--cds-rule);
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: 0.68rem;
+  line-height: 1.4;
+  color: var(--cds-ink);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 /* —— Preview column —— */
 .wppt-lab__variants {
   display: grid;

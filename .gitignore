@@ -2,6 +2,7 @@ node_modules/
 .env
 _test-cutout.png
 _verify-*.png
+_debug/
 .spacefast/state.json
 /.spacefast-*
 .spacefast/.spacefast-*

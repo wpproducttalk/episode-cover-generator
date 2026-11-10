@@ -3,7 +3,7 @@
  */
 import { createServer } from "node:http";
 import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer";
@@ -179,6 +179,49 @@ async function exportCoverPng(body, timer) {
 const server = createServer(async (req, res) => {
   const url = new URL(req.url || "/", `http://${host}:${port}`);
   const pathname = url.pathname;
+
+  // Block any HTTP GET access to local _debug artifacts
+  if (pathname.includes("_debug")) {
+    res.writeHead(403).end("Forbidden");
+    return;
+  }
+
+  // Local-only loopback endpoint to write diagnostic reports & stage PNGs to _debug/
+  if (req.method === "POST" && pathname === "/api/debug/save") {
+    const remote = req.socket?.remoteAddress || "";
+    if (remote !== "127.0.0.1" && remote !== "::1" && remote !== "::ffff:127.0.0.1") {
+      return json(res, 403, { error: "loopback_only" });
+    }
+    const body = await readBody(req);
+    if (!body) return json(res, 400, { error: "invalid_json" });
+    try {
+      const dbgDir = join(here, "_debug");
+      await mkdir(dbgDir, { recursive: true });
+      if (body.report) {
+        await writeFile(
+          join(dbgDir, "last-report.json"),
+          JSON.stringify(body.report, null, 2),
+          "utf8"
+        );
+      }
+      const writeDataUrl = async (dataUrl, fileName) => {
+        if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) return;
+        const comma = dataUrl.indexOf(",");
+        if (comma === -1) return;
+        const buf = Buffer.from(dataUrl.slice(comma + 1), "base64");
+        await writeFile(join(dbgDir, fileName), buf);
+      };
+      if (body.cutoutStagesDataUrl) {
+        await writeDataUrl(body.cutoutStagesDataUrl, "last-cutout-stages.png");
+      }
+      if (body.exportDataUrl) {
+        await writeDataUrl(body.exportDataUrl, "last-export.png");
+      }
+      return json(res, 200, { saved: true });
+    } catch (err) {
+      return json(res, 500, { error: err.message || String(err) });
+    }
+  }
 
   if (req.method === "POST" && pathname === "/api/export/png") {
     const timer = startTiming();
